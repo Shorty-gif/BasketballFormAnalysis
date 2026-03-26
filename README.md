@@ -1,7 +1,3 @@
-Here's a README for your project:
-
----
-
 # AI Basketball Coach
 
 An AI-powered basketball shooting form analyser that uses computer vision and machine learning to evaluate player mechanics, compare them to NBA pros, and deliver real coaching feedback.
