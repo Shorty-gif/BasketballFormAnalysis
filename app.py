@@ -5,11 +5,6 @@ Place this file at the PROJECT ROOT (same level as main.py).
 
 Run with:
     streamlit run app.py
-
-Three-tab UI:
-  Tab 1 — Image Upload  : upload player photos → pose + form score
-  Tab 2 — Video Upload  : upload video → auto extract frames → analyse each
-  Tab 3 — Live Webcam   : real-time pose via OpenCV (no extra packages needed)
 """
 
 import os
@@ -18,7 +13,6 @@ import cv2
 import json
 import time
 import tempfile
-import threading
 import numpy as np
 from pathlib import Path
 from typing import Optional, List, Dict
@@ -27,6 +21,10 @@ import streamlit as st
 
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
+
+# Ensure output dirs exist (ephemeral on Streamlit Cloud)
+for _dir in ["outputs/annotated_video", "outputs/prediction_results", "models"]:
+    Path(_dir).mkdir(parents=True, exist_ok=True)
 
 from inference.image_inference import process_image, OUTPUT_METRICS, OUTPUT_IMAGES
 from inference.frame_inference import analyse_frame
@@ -339,7 +337,6 @@ def get_grade(score: int) -> str:
     return "F"
 
 def render_score_panel(m: Dict):
-    """Full scoring panel for one analysed frame."""
     overall  = m.get("overall_score", 0)
     grade    = m.get("grade", get_grade(overall))
     phase    = m.get("phase", "unknown")
@@ -375,11 +372,11 @@ def render_score_panel(m: Dict):
 
     with col_metrics:
         metrics_def = [
-            ("elbow_angle",          f"Elbow angle",          m.get("elbow_angle",0),        "° (ideal 80–100°)"),
-            ("knee_angle",           f"Knee bend",            m.get("knee_angle",0),         "° (ideal 100–130°)"),
-            ("shoulder_angle",       f"Shoulder elevation",   m.get("shoulder_angle",0),     "° (ideal 45–75°)"),
-            ("wrist_elbow_vertical", f"Wrist/elbow vertical", m.get("wrist_elbow_vertical",0),"° off vertical"),
-            ("hip_knee_alignment",   f"Hip–knee alignment",   m.get("hip_knee_alignment",0), ""),
+            ("elbow_angle",          "Elbow angle",          m.get("elbow_angle",0),        "° (ideal 80–100°)"),
+            ("knee_angle",           "Knee bend",            m.get("knee_angle",0),         "° (ideal 100–130°)"),
+            ("shoulder_angle",       "Shoulder elevation",   m.get("shoulder_angle",0),     "° (ideal 45–75°)"),
+            ("wrist_elbow_vertical", "Wrist/elbow vertical", m.get("wrist_elbow_vertical",0),"° off vertical"),
+            ("hip_knee_alignment",   "Hip–knee alignment",   m.get("hip_knee_alignment",0), ""),
         ]
         bars_html = '<div class="card"><div class="card-title">Joint Analysis</div>'
         for key, label, val, unit in metrics_def:
@@ -398,7 +395,6 @@ def render_score_panel(m: Dict):
         bars_html += "</div>"
         st.markdown(bars_html, unsafe_allow_html=True)
 
-    # Priority coaching cue
     if feedback and scores:
         worst = min(scores, key=lambda k: scores[k])
         cue   = feedback.get(worst, "")
@@ -406,7 +402,6 @@ def render_score_panel(m: Dict):
             st.markdown(f'<div class="priority-box">💡 <strong>Priority:</strong> {cue}</div>',
                         unsafe_allow_html=True)
 
-    # Red flags
     from analysis.pose_analysis import detect_red_flags
     flags = detect_red_flags(m)
     if flags:
@@ -457,7 +452,6 @@ def call_gemini(session: Dict, all_metrics: List[Dict]) -> Optional[str]:
         client = gai.Client(api_key=api_key)
         prompt = build_gemini_prompt(session, all_metrics)
 
-        # Try models in order — flash-lite uses the least quota
         models_to_try = [
             "gemini-2.5-flash",
             "gemini-2.5-flash-8b",
@@ -473,26 +467,18 @@ def call_gemini(session: Dict, all_metrics: List[Dict]) -> Optional[str]:
             except Exception as e:
                 last_error = str(e)
                 err_lower  = last_error.lower()
-                # Only try next model on quota/rate errors
                 if "429" in last_error or "resource_exhausted" in err_lower or "quota" in err_lower:
                     import time
-                    time.sleep(2)   # small pause before retry
+                    time.sleep(2)
                     continue
                 else:
-                    # Non-quota error — don't retry with other models
                     break
 
-        # All models failed — give helpful message
         if "429" in last_error or "resource_exhausted" in last_error.lower():
             return (
                 "⚠️ Gemini quota exceeded on the free tier.\n\n"
-                "The free tier allows ~15 requests/minute and 1,500/day. "
-                "Wait 60 seconds and try again, or:\n"
-                "1. Go to https://aistudio.google.com\n"
-                "2. Create a new project and generate a fresh API key\n"
-                "3. Paste the new key in the sidebar\n\n"
-                "Alternatively, enable billing on your Google Cloud project "
-                "for higher limits."
+                "Wait 60 seconds and try again, or generate a fresh key at "
+                "https://aistudio.google.com"
             )
         return "Gemini error: " + last_error
 
@@ -500,10 +486,7 @@ def call_gemini(session: Dict, all_metrics: List[Dict]) -> Optional[str]:
         return "Gemini error: " + str(e)
 
 
-
-
 def render_ml_panel(m: Dict):
-    """Renders XGBoost score + k-NN pro player matches."""
     ml = m.get("ml", {})
     if not ml:
         return
@@ -511,13 +494,11 @@ def render_ml_panel(m: Dict):
     xgb_score   = ml.get("xgb_score")
     knn_matches = ml.get("knn_matches", [])
 
-    # Always try to show k-NN even if XGBoost not trained
     if not knn_matches:
-        # Try running k-NN directly if ml dict has no matches
         try:
             from analysis.ml_model import BasketballMLPredictor
-            predictor  = BasketballMLPredictor()
-            result     = predictor.predict(m)
+            predictor   = BasketballMLPredictor()
+            result      = predictor.predict(m)
             knn_matches = result.get("knn_matches", [])
             xgb_score   = result.get("xgb_score") or xgb_score
             ml["knn_matches"] = knn_matches
@@ -583,6 +564,7 @@ def render_ml_panel(m: Dict):
                 </div>
                 """, unsafe_allow_html=True)
             st.markdown("</div>", unsafe_allow_html=True)
+
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -673,14 +655,12 @@ with tab_img:
             prog.empty()
             status.empty()
 
-            # Session summary for multiple images
             if len(all_metrics) > 1:
                 session = aggregate_session(all_metrics)
                 render_session_summary(session)
             else:
                 session = aggregate_session(all_metrics) if all_metrics else {}
 
-            # Gemini coaching — works for single image OR multiple
             if gemini_img and all_metrics:
                 if st.session_state.get("gemini_key"):
                     with st.spinner("Calling Gemini AI coach…"):
@@ -730,7 +710,6 @@ with tab_vid:
     if uploaded_vid:
         if st.button("▶  Extract Frames & Analyse", key="btn_vid"):
 
-            # Write to temp file — OpenCV needs a real file path
             suffix = Path(uploaded_vid.name).suffix or ".mp4"
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                 tmp.write(uploaded_vid.read())
@@ -761,7 +740,7 @@ with tab_vid:
                 )
 
                 all_metrics: List[Dict] = []
-                sample_frames = []   # list of (frame_idx, rgb_frame, metrics_or_None)
+                sample_frames = []
 
                 prog    = st.progress(0)
                 status  = st.empty()
@@ -769,16 +748,12 @@ with tab_vid:
                 frame_idx = 0
                 analysed  = 0
 
-                # Skip first 10% of video (usually setup/walking)
                 skip_frames = max(0, int(total * 0.10))
                 for _ in range(skip_frames):
                     cap.read()
                     frame_idx += 1
 
-                # Set up annotated video writer
                 OUTPUT_VID = Path("outputs/annotated_video")
-                if OUTPUT_VID.exists() and not OUTPUT_VID.is_dir():
-                    OUTPUT_VID.unlink()   # remove stale file from earlier run
                 OUTPUT_VID.mkdir(parents=True, exist_ok=True)
                 out_vid_name = Path(uploaded_vid.name).stem + "_analyzed.mp4"
                 out_vid_path = OUTPUT_VID / out_vid_name
@@ -788,7 +763,6 @@ with tab_vid:
                     fps, (width, height)
                 )
 
-                # Read all frames, write annotated video, collect metrics
                 while cap.isOpened():
                     ret, frame = cap.read()
                     if not ret:
@@ -813,7 +787,6 @@ with tab_vid:
 
                             writer.write(ann_frame)
                         else:
-                            # No pose detected — write original frame with "no pose" label
                             no_pose = frame.copy()
                             cv2.putText(no_pose, "No pose detected", (10, 30),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100,100,100), 2)
@@ -829,13 +802,11 @@ with tab_vid:
                         if analysed >= max_frames:
                             break
                     else:
-                        # Write unskipped frames as-is to keep video timing correct
                         writer.write(frame)
 
                     frame_idx += 1
 
                 writer.release()
-
                 cap.release()
                 tmp_path.unlink(missing_ok=True)
                 prog.empty()
@@ -846,7 +817,6 @@ with tab_vid:
                     f"shooting detected in **{len(all_metrics)}** frames."
                 )
 
-                # Offer annotated video download
                 if out_vid_path.exists():
                     st.markdown("#### 🎬 Download Annotated Video")
                     with open(out_vid_path, "rb") as vf:
@@ -857,9 +827,7 @@ with tab_vid:
                             mime="video/mp4",
                             use_container_width=True,
                         )
-                    st.caption("Video saved to: outputs/annotated_video/" + out_vid_name)
 
-                # Sample frame grid
                 if sample_frames:
                     st.markdown("#### Sample Annotated Frames")
                     cols = st.columns(min(4, len(sample_frames)))
@@ -880,13 +848,11 @@ with tab_vid:
                     session = aggregate_session(all_metrics)
                     render_session_summary(session)
 
-                    # Best frame
                     best = max(all_metrics, key=lambda x: x.get("overall_score", 0))
                     st.markdown("#### Best Detected Frame")
                     render_score_panel(best)
                     render_ml_panel(best)
 
-                    # Save JSON
                     OUTPUT_METRICS.mkdir(parents=True, exist_ok=True)
                     out = OUTPUT_METRICS / "video_session.json"
                     with open(out, "w") as jf:
@@ -900,9 +866,6 @@ with tab_vid:
                                 st.markdown("### 🤖 Gemini Coaching Feedback")
                                 st.markdown(f'<div class="gemini-box">{coaching}</div>',
                                             unsafe_allow_html=True)
-                                cpath = OUTPUT_METRICS / "video_coaching.txt"
-                                with open(cpath, "w") as cf:
-                                    cf.write(coaching)
                         else:
                             st.info("Paste your Gemini API key in the sidebar.")
                 else:
@@ -913,112 +876,20 @@ with tab_vid:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# TAB 3 — LIVE WEBCAM  (OpenCV, no extra packages needed)
+# TAB 3 — LIVE WEBCAM (disabled on Streamlit Cloud)
 # ═══════════════════════════════════════════════════════════════════
 with tab_cam:
     st.markdown("#### Real-time pose estimation")
-    st.markdown(
-        '<div class="info-box">'
-        'Captures frames from your webcam using OpenCV and runs pose estimation live. '
-        'Click <strong>Start Camera</strong>, aim at a player, and watch the scores update.'
-        '</div>',
-        unsafe_allow_html=True,
+    st.info(
+        "🖥️ **Live webcam is not available on Streamlit Cloud** — "
+        "it requires direct camera hardware access. "
+        "To use this feature, clone the repo and run locally:\n\n"
+        "```\nstreamlit run app.py\n```"
     )
-
-    col_ctrl, col_info = st.columns([1, 2])
-
-    with col_ctrl:
-        start_cam  = st.button("▶  Start Camera",  key="start_cam")
-        stop_cam   = st.button("⏹  Stop Camera",   key="stop_cam")
-        cam_index  = st.number_input("Camera index", min_value=0, max_value=5,
-                                     value=0, step=1,
-                                     help="0 = built-in, 1+ = external")
-
-    with col_info:
-        st.markdown("""
-**How it works:**
-1. Click **Start Camera** — allow browser access if prompted
-2. Point the camera at yourself or a player in shooting position
-3. Pose keypoints, joint angles, and form score appear below
-4. Click **Stop Camera** when done
+    st.markdown("""
+**To run locally:**
+1. `git clone` your repo
+2. `pip install -r requirements.txt`
+3. `streamlit run app.py`
+4. The webcam tab will work automatically on your local machine.
 """)
-
-    # Frame display + metrics placeholder
-    frame_ph   = st.empty()
-    metrics_ph = st.empty()
-    session_ph = st.empty()
-
-    # Session state for webcam
-    if "cam_running" not in st.session_state:
-        st.session_state["cam_running"] = False
-    if "cam_metrics" not in st.session_state:
-        st.session_state["cam_metrics"] = []
-
-    if stop_cam:
-        st.session_state["cam_running"] = False
-
-    if start_cam:
-        st.session_state["cam_running"] = True
-        st.session_state["cam_metrics"] = []
-
-        cap = cv2.VideoCapture(int(cam_index))
-        if not cap.isOpened():
-            st.error(
-                f"Cannot open camera {int(cam_index)}. "
-                "Try a different camera index or check permissions."
-            )
-            st.session_state["cam_running"] = False
-        else:
-            frame_count = 0
-            st.info("Camera running… click **Stop Camera** to end the session.")
-
-            while st.session_state["cam_running"]:
-                ret, frame = cap.read()
-                if not ret:
-                    st.warning("Lost camera feed.")
-                    break
-
-                # Analyse every 3rd frame for performance
-                if frame_count % 3 == 0:
-                    result = analyse_frame(frame)
-                    if result:
-                        ann = result.pop("annotated_frame")
-                        rgb = cv2.cvtColor(ann, cv2.COLOR_BGR2RGB)
-                        st.session_state["cam_metrics"].append(result)
-                    else:
-                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        result = None
-
-                    # Display annotated frame
-                    frame_ph.image(rgb, channels="RGB", use_container_width=True)
-
-                    # Display latest metrics
-                    if result:
-                        with metrics_ph.container():
-                            render_score_panel(result)
-
-                frame_count += 1
-                time.sleep(0.03)   # ~30 fps cap
-
-            cap.release()
-            st.session_state["cam_running"] = False
-            st.success(
-                f"Session ended — {len(st.session_state['cam_metrics'])} frames with pose data."
-            )
-
-            # Session summary after webcam
-            cam_data = st.session_state["cam_metrics"]
-            if len(cam_data) > 5:
-                with session_ph.container():
-                    session = aggregate_session(cam_data)
-                    render_session_summary(session)
-
-                    if st.session_state.get("gemini_key"):
-                        with st.spinner("Calling Gemini…"):
-                            coaching = call_gemini(session, cam_data)
-                        if coaching:
-                            st.markdown("### 🤖 Gemini Coaching Feedback")
-                            st.markdown(
-                                f'<div class="gemini-box">{coaching}</div>',
-                                unsafe_allow_html=True,
-                            )
